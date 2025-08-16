@@ -1,0 +1,20 @@
+{
+   "mode": "discord-only",
+  "bridge_url": "http://127.0.0.1:5000/promote",  
+  "requirements": {
+    "networth": 10000000000,
+    "sb_level": 300,
+    "skill_avg": 50,
+    "slayer_xp": 2000000,
+    "cata_lvl": 38,
+    "rift_charms": "all",
+    "farm_weight": 10000
+    
+  },
+  "mastery_ranks": {
+    "0": "Primus",
+    "2": "Legatus",
+    "4": "Dominus",
+    "7": "Master"
+  }
+}
