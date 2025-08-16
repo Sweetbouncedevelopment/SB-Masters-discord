@@ -1,6 +1,4 @@
 {
-   "mode": "discord-only",
-  "bridge_url": "http://127.0.0.1:5000/promote",  
   "requirements": {
     "networth": 10000000000,
     "sb_level": 300,

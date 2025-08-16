@@ -17,10 +17,10 @@ class PersistentPromotionApproveView(discord.ui.View):
     @discord.ui.button(
         label="Approve Promotion",
         style=discord.ButtonStyle.success,
-        custom_id="promo:approve"   # fixed ID => persists across restarts
+        custom_id="promo:approve"
     )
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Permission check (lightweight — only staff should be pressing this)
+        # Permission check
         perms = interaction.user.guild_permissions
         if not (perms.manage_roles or perms.administrator):
             return await interaction.response.send_message(
@@ -41,19 +41,16 @@ class PersistentPromotionApproveView(discord.ui.View):
         ign = m_ign.group(1).strip()
         role_name = m_rank.group(1).strip()
 
-        # Target Discord member = first mention in the message content (posted by /getroles)
         if not msg.mentions:
             return await interaction.response.send_message("No target member mention found.", ephemeral=True)
         target_member = msg.mentions[0]
 
-        # Find the role by name
         role = discord.utils.get(interaction.guild.roles, name=role_name)
         if not role:
             return await interaction.response.send_message(
                 f"Role **{role_name}** not found in this server.", ephemeral=True
             )
 
-        # Bot permission / hierarchy checks
         me = interaction.guild.me
         if not me or not me.guild_permissions.manage_roles:
             return await interaction.response.send_message("I need **Manage Roles** permission.", ephemeral=True)
@@ -69,13 +66,14 @@ class PersistentPromotionApproveView(discord.ui.View):
         except discord.Forbidden:
             return await interaction.response.send_message("I don't have permission to edit that member.", ephemeral=True)
 
-        # Log if configured
+        # Log
         cfg = get_guild_cfg(interaction.guild_id)
         log_ch = interaction.guild.get_channel(int(cfg.get("log_channel_id") or 0))
         if log_ch:
             await log_ch.send(
-                f"📜 {target_member.mention} promoted to **{role.name}** "
-                f"(IGN: **{ign}**, approved by {interaction.user.mention})"
+                f"✅ **Promotion Approved** — {target_member.mention} → **{role.name}** "
+                f"(IGN **{ign}**, by {interaction.user.mention}) • "
+                f"[Jump]({msg.jump_url})"
             )
 
         await interaction.response.send_message(
@@ -86,7 +84,7 @@ class PersistentPromotionApproveView(discord.ui.View):
     @discord.ui.button(
         label="Reject",
         style=discord.ButtonStyle.danger,
-        custom_id="promo:reject"    # fixed ID => persists
+        custom_id="promo:reject"
     )
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
         perms = interaction.user.guild_permissions
@@ -94,4 +92,26 @@ class PersistentPromotionApproveView(discord.ui.View):
             return await interaction.response.send_message(
                 "You need **Manage Roles** to reject promotions.", ephemeral=True
             )
+
+        # Log
+        cfg = get_guild_cfg(interaction.guild_id)
+        log_ch = interaction.guild.get_channel(int(cfg.get("log_channel_id") or 0))
+        msg = interaction.message
+        embed = msg.embeds[0] if (msg and msg.embeds) else None
+        ign = None
+        role_name = None
+        if embed:
+            desc = embed.description or ""
+            ig = IGN_PATTERN.search(desc)
+            rk = RANK_PATTERN.search(desc)
+            ign = ig.group(1).strip() if ig else None
+            role_name = rk.group(1).strip() if rk else None
+
+        if log_ch:
+            await log_ch.send(
+                f"❌ **Promotion Rejected** — IGN **{ign or 'Unknown'}**, "
+                f"target rank **{role_name or 'Unknown'}** • by {interaction.user.mention} • "
+                f"[Jump]({msg.jump_url if msg else ''})"
+            )
+
         await interaction.response.send_message("❌ Promotion request rejected.", ephemeral=True)
