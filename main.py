@@ -6,11 +6,10 @@ import inspect
 import discord
 from dotenv import load_dotenv
 from discord import app_commands
-from utils.checks import ADMIN_ROLE_IDS
 
 # ===== .env =====
 load_dotenv()
-TOKEN = os.getenv('DISCORD_TOKEN')
+TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing in .env")
 
@@ -23,9 +22,9 @@ logger.addHandler(file_handler)
 
 # ===== Intents =====
 intents = discord.Intents.default()
-intents.members = True
-intents.dm_messages = True
-intents.message_content = True
+intents.members = True          # you use member join + role assignment
+intents.dm_messages = True      # you DM users for verification
+intents.message_content = True  # if you rely on message content anywhere else
 
 # ===== Client =====
 class Client(discord.Client):
@@ -42,6 +41,7 @@ class Client(discord.Client):
                 for _, obj in inspect.getmembers(module, inspect.isclass):
                     if issubclass(obj, discord.ui.View) and obj is not discord.ui.View:
                         try:
+                            # Views must have a no-arg __init__ to be persisted at startup
                             self.add_view(obj())
                             print(f"✅ Loaded view: {obj.__name__}")
                         except Exception as e:
@@ -49,44 +49,36 @@ class Client(discord.Client):
 
         # 2) Load commands and events
         for pkg in ("commands", "events"):
-            for fname in os.listdir(f"./{pkg}"):
+            pkg_path = f"./{pkg}"
+            if not os.path.isdir(pkg_path):
+                continue
+            for fname in os.listdir(pkg_path):
                 if fname.endswith(".py") and not fname.startswith("__"):
                     modname = f"{pkg}.{fname[:-3]}"
                     module = importlib.import_module(modname)
                     if hasattr(module, "setup"):
-                        await module.setup(self)
+                        try:
+                            await module.setup(self)
+                            print(f"✅ Loaded {pkg} module: {modname}")
+                        except Exception as e:
+                            print(f"⚠ Failed to load {pkg} module {modname}: {e}")
 
-        # 3) Sync commands globally
-        synced = await self.tree.sync()
-        print(f"🔁 Global sync -> {len(synced)} commands")
-        print(len(self.tree.get_commands()), [cmd.name for cmd in self.tree.get_commands()])
+        # 3) (Optional) one-time reset if your command list got messy:
+        #self.tree.clear_commands(guild=None)  # uncomment once if you need a clean republish
 
+        # 4) Sync commands globally
+        try:
+            synced = await self.tree.sync()
+            names = [cmd.name for cmd in self.tree.get_commands()]
+            print(f"🔁 Global sync -> {len(synced)} commands")
+            print(len(names), names)
+        except Exception as e:
+            print(f"⚠ Command sync failed: {e}")
 
-        # 4) Update visibility for admin-only commands
-        admin_only_cmds = {
-            "verification_setup",
-            "verification_reset",
-            "verification_settings",
-            "setuplogs",
-            "logtest",
-            "sync"
-        }
-        for guild in self.guilds:
-            for cmd in synced:
-                if cmd.name in admin_only_cmds:
-                    perms = []
-                    for rid in ADMIN_ROLE_IDS:
-                        perms.append(app_commands.CommandPermission(
-                            id=rid, type=1, permission=True
-                        ))
-                    perms.append(app_commands.CommandPermission(
-                        id=guild.default_role.id, type=1, permission=False
-                    ))
-                    try:
-                        await self.tree.set_command_permissions(guild.id, cmd.id, perms)
-                        print(f"✅ Set permissions for '{cmd.name}' in {guild.name}")
-                    except Exception as e:
-                        print(f"⚠ Could not set permissions for '{cmd.name}' in {guild.name}: {e}")
+        # NOTE: Old per-command permissions API removed. Use:
+        # - @app_commands.default_permissions(...) on admin-only commands for default visibility
+        # - Your own role checks in code for execution (e.g., ADMIN_ROLES_IDS)
+        # - Server Settings → Integrations → Commands for UI role visibility overrides
 
     async def on_ready(self):
         print(f"Logged on as {self.user}! (ID: {self.user.id})")

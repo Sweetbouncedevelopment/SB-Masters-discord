@@ -52,7 +52,6 @@ cover/
 
 # --- Secrets ---
 .env
-*.env
 .env.*
 
 # Logs

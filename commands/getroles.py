@@ -2,12 +2,13 @@
 import os
 import aiohttp
 import discord
-from discord import app_commands
+from discord import app_commands, AllowedMentions
+from discord.errors import HTTPException
 from utils.checks import is_guild_admin
 from utils.role_config import load_role_config
 from utils.hypixel_api import get_sb_stats
 from utils.config import get_guild_cfg
-from views.promotion_view import PersistentPromotionApproveView  # approval UI for discord-only mode
+from views.promotion_view import PersistentPromotionApproveView  # MUST be timeout=None, has custom_ids
 
 # Read mode/bridge from environment
 PROMOTION_MODE = (os.getenv("PROMOTION_MODE") or "discord-only").strip().lower()
@@ -18,11 +19,69 @@ VALID_MODES = {"discord-only", "auto-mc"}
 if PROMOTION_MODE not in VALID_MODES:
     PROMOTION_MODE = "discord-only"  # safe default
 
+MAX_CONTENT = 2000
+
+
+def _trim(s: str, limit: int) -> str:
+    s = str(s)
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+async def _send_with_log(op: str, coro, log_ch: discord.TextChannel | None):
+    """Run a Discord API call; on failure, log status/code/text to log_ch."""
+    try:
+        return await coro
+    except HTTPException as ex:
+        if log_ch:
+            status = getattr(ex, "status", "?")
+            code = getattr(ex, "code", "?")
+            text = getattr(ex, "text", str(ex))
+            await log_ch.send(_trim(f"⚠ {op} failed — HTTP {status} / code {code}:\n{text}", MAX_CONTENT))
+        return None
+
+
+async def safe_queue_send(
+    queue: discord.TextChannel,
+    who: discord.abc.User,
+    embed: discord.Embed,
+    view: discord.ui.View | None,
+    log_ch: discord.TextChannel | None
+):
+    """
+    Send to queue safely: embed+view first (empty content), then tiny ping.
+    Falls back to minimal message if Discord rejects. Logs details.
+    """
+    allowed = AllowedMentions(everyone=False, users=[who], roles=False, replied_user=False)
+
+    msg = await _send_with_log(
+        "queue.send(embed+view)",
+        queue.send(content="", embed=embed, view=view, allowed_mentions=allowed),
+        log_ch
+    )
+    if msg is None:
+        # last-resort fallback: minimal text only
+        note = _trim(f"{who.mention} Promotion request created (embed/view trimmed).", MAX_CONTENT)
+        msg = await _send_with_log("queue.send(text-only)", queue.send(content=note, allowed_mentions=allowed), log_ch)
+
+    # tiny separate ping (kept under 2k; okay to skip if it fails)
+    await _send_with_log("queue.send(mention)", queue.send(content=who.mention, allowed_mentions=allowed), log_ch)
+    return msg
+
+
 async def setup(client: discord.Client):
+    # ✅ Register the persistent view on startup so components are recognized by Discord
+    # Your PersistentPromotionApproveView must set timeout=None and define explicit custom_id values.
+    try:
+        client.add_view(PersistentPromotionApproveView())
+    except Exception:
+        # If your view needs runtime params, consider registering a "blank" version here
+        # and constructing per-message instances later.
+        pass
+
     tree = client.tree
 
     @tree.command(
-        name="promote",  # change to "getroles" if you want to keep the old name
+        name="promote",
         description="Evaluate requirements and request a promotion (discord-only or auto-mc depending on env)"
     )
     @is_guild_admin()
@@ -31,7 +90,6 @@ async def setup(client: discord.Client):
         username: str,
         member: discord.Member | None = None
     ):
-        """Check stats, decide rank, and either queue approval or auto-promote via bridge."""
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         cfg_data = load_role_config()
@@ -79,11 +137,10 @@ async def setup(client: discord.Client):
         gcfg = get_guild_cfg(interaction.guild_id)
         log_ch = interaction.guild.get_channel(int(gcfg.get("log_channel_id") or 0))
 
-        # 4) Modes (now from ENV)
+        # 4) Modes
         mode = PROMOTION_MODE
 
         if mode == "discord-only":
-            # Post approval card in the configured promotion queue channel
             queue_id = gcfg.get("promotion_channel_id")
             if not queue_id:
                 return await interaction.followup.send(
@@ -95,29 +152,35 @@ async def setup(client: discord.Client):
                 return await interaction.followup.send("Promotion channel invalid.", ephemeral=True)
 
             who = (member or interaction.user)
+
+            # Build trimmed embed (stay within Discord limits)
             e = discord.Embed(
-                title="Promotion Request",
-                description=f"IGN: **{username}**\nTarget Rank: **{role_name}**",
+                title=_trim("Promotion Request", 256),
+                description=_trim(f"IGN: **{username}**\nTarget Rank: **{role_name}**", 4096),
                 color=discord.Color.green()
             )
-            e.add_field(name="Masteries", value=str(mastery_count))
-            e.add_field(name="SB Level", value=str(stats["sb_level"]))
-            e.add_field(name="Skill Avg", value=str(stats["skill_avg"]))
-            e.add_field(name="Cata", value=str(stats["cata_lvl"]))
-            e.add_field(name="Slayer XP", value=f"{stats['slayer_xp']:,}")
-            e.add_field(name="Networth", value=f"{stats['networth']:,}")
-            e.add_field(name="Farm Weight", value=f"{stats['farm_weight']:,}")
-            e.add_field(name="Rift Charms", value="All" if stats["rift_all_charms"] else "Incomplete")
-            e.set_footer(text=f"Requested by {interaction.user}")
+            e.add_field(name="Masteries", value=_trim(str(mastery_count), 1024))
+            e.add_field(name="SB Level", value=_trim(str(stats["sb_level"]), 1024))
+            e.add_field(name="Skill Avg", value=_trim(str(stats["skill_avg"]), 1024))
+            e.add_field(name="Cata", value=_trim(str(stats["cata_lvl"]), 1024))
+            e.add_field(name="Slayer XP", value=_trim(f"{stats['slayer_xp']:,}", 1024))
+            e.add_field(name="Networth", value=_trim(f"{stats['networth']:,}", 1024))
+            e.add_field(name="Farm Weight", value=_trim(f"{stats['farm_weight']:,}", 1024))
+            e.add_field(name="Rift Charms", value=_trim("All" if stats["rift_all_charms"] else "Incomplete", 1024))
+            e.set_footer(text=_trim(f"Requested by {interaction.user}", 2048))
 
-            # Mention the target Discord member so the Approve handler can grant role
-            view = PersistentPromotionApproveView()  # as required by your view implementation:contentReference[oaicite:1]{index=1}
-            msg = await queue.send(content=who.mention, embed=e, view=view)
+            # Create the view instance you want to attach (must use custom_id per item)
+            view = PersistentPromotionApproveView()
+
+            msg = await safe_queue_send(queue, who, e, view, log_ch)
 
             # Log queued request
-            if log_ch:
+            if log_ch and msg:
                 await log_ch.send(
-                    f"📬 **Promotion Queued** — {who.mention} | IGN **{username}** → **{role_name}** • [Jump]({msg.jump_url})"
+                    _trim(
+                        f"📬 **Promotion Queued** — {who.mention} | IGN **{username}** → **{role_name}** • [Jump]({msg.jump_url})",
+                        MAX_CONTENT
+                    )
                 )
 
             return await interaction.followup.send("✅ Queued promotion for approval.", ephemeral=True)
@@ -130,10 +193,8 @@ async def setup(client: discord.Client):
                     ephemeral=True
                 )
 
-            # Default target Discord member (for mirroring role)
             target_member = member or interaction.guild.get_member(interaction.user.id)
 
-            # Bridge payload
             payload = {
                 "action": "promote",
                 "ign": username,
@@ -157,46 +218,44 @@ async def setup(client: discord.Client):
             except Exception as e:
                 body = f"{e}"
 
-            # Log outcome to log channel
             if log_ch:
-                if ok:
-                    await log_ch.send(
-                        f"🤖 **Auto-MC Promote** — IGN **{username}** → **{role_name}** • "
-                        f"requested by {interaction.user.mention}\n"
-                        f"Bridge response: `{(body[:1800] + '…') if len(body) > 1800 else body}`"
+                log_body = (body[:1800] + "…") if len(body) > 1800 else body
+                prefix = "🤖 **Auto-MC Promote**" if ok else "⚠ **Auto-MC Promote FAILED**"
+                await log_ch.send(
+                    _trim(
+                        f"{prefix} — IGN **{username}** → **{role_name}** • requested by {interaction.user.mention}\n"
+                        f"Bridge response: `{log_body}`",
+                        MAX_CONTENT
                     )
-                else:
-                    await log_ch.send(
-                        f"⚠ **Auto-MC Promote FAILED** — IGN **{username}** → **{role_name}** • "
-                        f"requested by {interaction.user.mention}\n"
-                        f"Bridge response: `{(body[:1800] + '…') if len(body) > 1800 else body}`"
-                    )
+                )
 
             if not ok:
                 return await interaction.followup.send(
-                    f"⚠ Auto-MC bridge error.\n```text\n{body[:1500]}\n```",
+                    _trim(f"⚠ Auto-MC bridge error.\n```text\n{body[:1500]}\n```", MAX_CONTENT),
                     ephemeral=True
                 )
 
-            # Mirror the Discord role locally (optional)
             if target_role and target_member:
                 try:
                     await target_member.add_roles(target_role, reason=f"Auto-MC promote to {role_name}")
                 except discord.Forbidden:
                     if log_ch:
                         await log_ch.send(
-                            f"⚠ Could not assign Discord role **{role_name}** to {target_member.mention} "
-                            f"(insufficient permissions)."
+                            _trim(
+                                f"⚠ Could not assign Discord role **{role_name}** to {target_member.mention} "
+                                f"(insufficient permissions).",
+                                MAX_CONTENT
+                            )
                         )
 
             await interaction.followup.send(
-                f"✅ Auto-promoted **{username}** in Hypixel (target rank: **{role_name}**).",
+                _trim(f"✅ Auto-promoted **{username}** in Hypixel (target rank: **{role_name}**).", MAX_CONTENT),
                 ephemeral=False
             )
             return
 
         else:
             return await interaction.followup.send(
-                f"Unknown promotion mode in env: `{mode}`. Use `discord-only` or `auto-mc`.",
+                _trim(f"Unknown promotion mode in env: `{mode}`. Use `discord-only` or `auto-mc`.", MAX_CONTENT),
                 ephemeral=True
             )
